@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde_json::json;
 use std::path::Path;
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 
 use crate::config;
@@ -338,6 +339,12 @@ fn format_missing_preview(items: &[scanner::MissingDb], max: usize) -> String {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn find_wechat_pid() -> Option<u32> {
+    crate::scanner::windows::find_wechat_pid()
+}
+
+#[cfg(not(target_os = "windows"))]
 fn find_wechat_pid() -> Option<u32> {
     let out = Command::new("pgrep").args(["-x", "WeChat"]).output().ok()?;
     if !out.status.success() {
