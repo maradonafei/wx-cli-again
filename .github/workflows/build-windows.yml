@@ -1,0 +1,67 @@
+name: Build Windows binary
+
+on:
+  workflow_dispatch:
+
+# This workflow only reads the repository and uploads a temporary Actions artifact.
+# GitHub manual-run docs:
+# https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x86_64 (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_TARGET: x86_64-pc-windows-msvc
+      ASSET_NAME: wx-windows-x86_64.exe
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      # The action's `targets` input installs the requested Rust target:
+      # https://github.com/dtolnay/rust-toolchain#inputs
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build locked release binary
+        run: cargo build --release --locked --target $env:RUST_TARGET
+
+      - name: Stage and verify artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifact -Force | Out-Null
+          Copy-Item "target\$env:RUST_TARGET\release\wx.exe" "artifact\$env:ASSET_NAME"
+
+          $version = & "artifact\$env:ASSET_NAME" --version
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '(^|\s)0\.6\.3(\s|$)') {
+            throw "Unexpected wx version: $version"
+          }
+
+          $hash = (Get-FileHash -Algorithm SHA256 "artifact\$env:ASSET_NAME").Hash.ToLowerInvariant()
+          "$hash  $env:ASSET_NAME" | Set-Content -Encoding ascii artifact\SHA256SUMS.txt
+          Write-Host "Built $version"
+          Write-Host "SHA-256: $hash"
+
+      # GitHub documents upload-artifact@v4 and per-artifact retention-days:
+      # https://docs.github.com/en/actions/tutorials/store-and-share-data#configuring-a-custom-artifact-retention-period
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wx-windows-x86_64
+          path: |
+            artifact/wx-windows-x86_64.exe
+            artifact/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7

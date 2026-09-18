@@ -18,6 +18,11 @@ run_hook.bat
 # Rust
 target/
 
+# Project-local Windows binary (downloaded from the private release)
+.local/
+wx-windows-x86_64.exe
+wx-windows-x86_64.zip
+
 # Python
 __pycache__/
 *.py[cod]
