@@ -12,20 +12,18 @@ use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::System::Memory::{
-    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
-};
+use windows::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
 use super::{
-    collect_db_salts, is_writable_readable_page, match_raw_keys, scan_key_patterns, KeyEntry,
-    MAX_PATTERN_BYTES,
+    collect_db_salts, collect_salt_adjacent_keys, decode_salt_hex, is_writable_readable_page,
+    match_raw_keys, scan_key_patterns, KeyEntry, MAX_PATTERN_BYTES,
 };
 
 const CHUNK_SIZE: usize = 2 * 1024 * 1024;
 
 /// 查找 Weixin.exe 进程 PID
-fn find_wechat_pid() -> Option<u32> {
+pub(crate) fn find_wechat_pid() -> Option<u32> {
     // SAFETY: CreateToolhelp32Snapshot 标准 Windows API
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()? };
 
@@ -68,10 +66,14 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     };
 
     let db_salts = collect_db_salts(db_dir);
+    let salt_bytes: Vec<[u8; 16]> = db_salts
+        .iter()
+        .filter_map(|(salt, _)| decode_salt_hex(salt))
+        .collect();
     eprintln!("找到 {} 个加密数据库", db_salts.len());
 
     eprintln!("扫描进程内存...");
-    let raw_keys = scan_memory(process)?;
+    let raw_keys = scan_memory(process, &salt_bytes)?;
     eprintln!("找到 {} 个候选密钥", raw_keys.len());
 
     // SAFETY: 关闭进程句柄
@@ -89,8 +91,10 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     Ok(entries)
 }
 
-fn scan_memory(process: HANDLE) -> Result<Vec<(String, String)>> {
+fn scan_memory(process: HANDLE, salts: &[[u8; 16]]) -> Result<Vec<(String, String)>> {
     let mut results: Vec<(String, String)> = Vec::new();
+    let mut adjacent_keys: Vec<String> = Vec::new();
+    let mut seen_adjacent = std::collections::HashSet::new();
     let mut addr: usize = 0;
 
     loop {
@@ -114,7 +118,15 @@ fn scan_memory(process: HANDLE) -> Result<Vec<(String, String)>> {
         // 只扫描已提交的可读可写页面（含 WRITECOPY / EXECUTE_*WRITE*；见
         // `is_writable_readable_page`，从 old-main #54 捞回）。
         if mbi.State == MEM_COMMIT && is_writable_readable_page(mbi.Protect.0) {
-            scan_region(process, base, region_size, &mut results);
+            scan_region(
+                process,
+                base,
+                region_size,
+                salts,
+                &mut results,
+                &mut adjacent_keys,
+                &mut seen_adjacent,
+            );
         }
 
         addr = base.saturating_add(region_size);
@@ -123,10 +135,21 @@ fn scan_memory(process: HANDLE) -> Result<Vec<(String, String)>> {
         }
     }
 
+    // `match_raw_keys` 会把空 salt 的条目当作普通候选，并用实际数据库
+    // HMAC/首页解密逐一验证；因此不会把邻近内存中的随机 32 字节写入配置。
+    results.extend(adjacent_keys.into_iter().map(|key| (key, String::new())));
     Ok(results)
 }
 
-fn scan_region(process: HANDLE, base: usize, size: usize, results: &mut Vec<(String, String)>) {
+fn scan_region(
+    process: HANDLE,
+    base: usize,
+    size: usize,
+    salts: &[[u8; 16]],
+    results: &mut Vec<(String, String)>,
+    adjacent_keys: &mut Vec<String>,
+    seen_adjacent: &mut std::collections::HashSet<String>,
+) {
     let overlap = MAX_PATTERN_BYTES;
     let mut offset = 0usize;
 
@@ -153,7 +176,8 @@ fn scan_region(process: HANDLE, base: usize, size: usize, results: &mut Vec<(Str
 
         if ok && bytes_read > 0 {
             buf.truncate(bytes_read);
-            search_pattern(&buf, results);
+            scan_key_patterns(&buf, results);
+            collect_salt_adjacent_keys(&buf, salts, adjacent_keys, seen_adjacent);
         }
 
         if chunk_size > overlap {
@@ -162,8 +186,4 @@ fn scan_region(process: HANDLE, base: usize, size: usize, results: &mut Vec<(Str
             offset += chunk_size;
         }
     }
-}
-
-fn search_pattern(buf: &[u8], results: &mut Vec<(String, String)>) {
-    scan_key_patterns(buf, results);
 }
