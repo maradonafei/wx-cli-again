@@ -133,7 +133,15 @@ function Install-ProjectLocalWx {
     param([string]$SourcePath)
 
     New-Item -ItemType Directory -Path $LocalBinDir -Force | Out-Null
-    Copy-Item -LiteralPath $SourcePath -Destination $WxPath -Force
+    $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $SourcePath).Hash
+    $installedHash = if (Test-Path -LiteralPath $WxPath -PathType Leaf) {
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $WxPath).Hash
+    } else {
+        $null
+    }
+    if ($sourceHash -ne $installedHash) {
+        Copy-Item -LiteralPath $SourcePath -Destination $WxPath -Force
+    }
 
     $versionText = (Invoke-WxText -Executable $WxPath -Arguments @('--version')).Trim()
     if ($versionText -notmatch "(^|\s)$([regex]::Escape($ExpectedVersion))(\s|$)") {
@@ -230,21 +238,45 @@ foreach ($field in $requiredFields) {
     }
 }
 
-$invalidUrlCount = @(
-    $articles | Where-Object {
+$urlClasses = @(
+    $articles | ForEach-Object {
         $uri = $null
-        -not [uri]::TryCreate([string]$_.url, [System.UriKind]::Absolute, [ref]$uri) -or
-        $uri.Host -ne 'mp.weixin.qq.com'
+        $isHttpUrl = [uri]::TryCreate(
+            [string]$_.url,
+            [System.UriKind]::Absolute,
+            [ref]$uri
+        ) -and $uri.Scheme -in @('http', 'https')
+        if (-not $isHttpUrl) {
+            'invalid'
+        } elseif ($uri.Host -eq 'mp.weixin.qq.com') {
+            'weixin_article'
+        } else {
+            'external_http'
+        }
+    }
+)
+$invalidUrlCount = @($urlClasses | Where-Object { $_ -eq 'invalid' }).Count
+$weixinArticleUrlCount = @($urlClasses | Where-Object { $_ -eq 'weixin_article' }).Count
+$externalHttpUrlCount = @($urlClasses | Where-Object { $_ -eq 'external_http' }).Count
+$missingRequiredFieldCount = @(
+    $fieldCoverage.GetEnumerator() | Where-Object {
+        $_.Value.present -ne $_.Value.total
     }
 ).Count
 
 $summary = [ordered]@{
-    status = if ($articles.Count -gt 0 -and $invalidUrlCount -eq 0) { 'poc_query_ok' } else { 'poc_needs_review' }
+    status = if (
+        $articles.Count -gt 0 -and
+        $invalidUrlCount -eq 0 -and
+        $missingRequiredFieldCount -eq 0
+    ) { 'poc_query_ok' } else { 'poc_needs_review' }
     wx_version = $installation.Version
     wx_sha256 = $installation.Sha256
     article_count = $articles.Count
     unique_account_count = @($articles.account_username | Where-Object { $_ } | Sort-Object -Unique).Count
-    invalid_weixin_url_count = $invalidUrlCount
+    weixin_article_url_count = $weixinArticleUrlCount
+    external_http_url_count = $externalHttpUrlCount
+    invalid_http_url_count = $invalidUrlCount
     field_coverage = $fieldCoverage
     privacy = '摘要不包含公众号名称、文章标题、URL、数据库路径或密钥。'
 }

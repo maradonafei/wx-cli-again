@@ -64,7 +64,7 @@ Set-Location 'D:\AI TASK\common_tools\wx-cli'
 2. 验证版本为 `0.6.3` 并报告 SHA-256；
 3. 运行 `wx doctor --json`；
 4. 前置条件通过后运行 `wx biz-articles -n 200 --json`；
-5. 只输出数量、字段覆盖率和 URL 域名检查，不输出公众号名称、标题、URL、数据库路径或密钥。
+5. 只输出数量、字段覆盖率和 URL 分类检查，不输出公众号名称、标题、URL、数据库路径或密钥。
 
 ## 4. 首次初始化边界
 
@@ -83,6 +83,6 @@ PowerShell，重新运行 POC 脚本。
 
 - `biz-articles` 能成功返回数据；
 - 文章字段覆盖率可计算；
-- URL 均属于 `mp.weixin.qq.com`；
+- URL 均为合法 HTTP(S)；分别报告 `mp.weixin.qq.com` 文章链接与合法外部服务链接；
 - 后续人工抽查 3～5 个公众号，确认多图文展开和接收时间符合微信客户端；
 - 查询失败时能明确区分未初始化、缺密钥和缺 `biz_message_*.db` 分片。
