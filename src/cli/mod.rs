@@ -439,6 +439,27 @@ enum SubscribeAction {
         #[arg(long)]
         json: bool,
     },
+    /// 从本地微信数据库增量采集已订阅公众号文章并写入索引
+    Sync {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 仅查询本地文章索引（不会扫描微信数据库）
+    Articles {
+        #[arg(short = 'n', long, default_value = "50")]
+        limit: usize,
+        /// 按公众号名称、username 或 __biz 模糊过滤
+        #[arg(long)]
+        account: Option<String>,
+        /// 起始时间 YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// 结束时间 YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -644,6 +665,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             SubscribeAction::Add { url, json } => subscribe::cmd_add(url, json),
             SubscribeAction::List { all, json } => subscribe::cmd_list(all, json),
             SubscribeAction::Remove { account_id, json } => subscribe::cmd_remove(account_id, json),
+            SubscribeAction::Sync { json } => subscribe::cmd_sync(json),
+            SubscribeAction::Articles {
+                limit,
+                account,
+                since,
+                until,
+                json,
+            } => subscribe::cmd_articles(limit, account, since, until, json),
         },
         Commands::Attachments {
             chat,
@@ -803,5 +832,49 @@ mod clap_msg_type_wiring_tests {
     fn subscribe_remove_requires_numeric_id() {
         assert!(Cli::try_parse_from(["wx", "subscribe", "remove", "--account-id", "12"]).is_ok());
         assert!(Cli::try_parse_from(["wx", "subscribe", "remove", "--account-id", "abc"]).is_err());
+    }
+
+    #[test]
+    fn subscribe_sync_and_index_query_parse() {
+        let sync = Cli::try_parse_from(["wx", "subscribe", "sync", "--json"])
+            .expect("subscribe sync should parse");
+        assert!(matches!(
+            sync.command,
+            super::Commands::Subscribe {
+                action: super::SubscribeAction::Sync { json: true }
+            }
+        ));
+
+        let query = Cli::try_parse_from([
+            "wx",
+            "subscribe",
+            "articles",
+            "--account",
+            "Alpha",
+            "--since",
+            "2026-01-01",
+            "-n",
+            "5",
+            "--json",
+        ])
+        .expect("subscribe articles should parse");
+        match query.command {
+            super::Commands::Subscribe {
+                action:
+                    super::SubscribeAction::Articles {
+                        limit,
+                        account,
+                        since,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(limit, 5);
+                assert_eq!(account.as_deref(), Some("Alpha"));
+                assert_eq!(since.as_deref(), Some("2026-01-01"));
+                assert!(json);
+            }
+            _ => panic!("expected subscribe articles"),
+        }
     }
 }

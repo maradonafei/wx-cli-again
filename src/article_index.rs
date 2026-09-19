@@ -1,9 +1,13 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+const LOCAL_SOURCE: &str = "wechat_local";
+const INDEX_PATH_ENV: &str = "WX_ARTICLE_INDEX_PATH";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArticleUrlIdentity {
@@ -167,12 +171,67 @@ pub struct SubscriptionRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct LocalArticleInput {
+    pub account_username: String,
+    #[serde(rename = "account")]
+    pub account_display: String,
+    pub wechat_biz: String,
+    pub mid: String,
+    pub idx: String,
+    #[serde(default)]
+    pub sn: Option<String>,
+    pub canonical_url: String,
+    pub title: String,
+    #[serde(default)]
+    pub digest: String,
+    #[serde(default)]
+    pub cover_url: String,
+    #[serde(rename = "timestamp")]
+    pub publish_time: i64,
+    pub recv_time: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct IndexedArticle {
+    pub id: i64,
+    pub account_id: i64,
+    pub account_username: String,
+    pub account: String,
+    pub wechat_biz: String,
+    pub mid: String,
+    pub idx: String,
+    pub sn: Option<String>,
+    pub canonical_url: String,
+    pub title: String,
+    pub digest: String,
+    pub cover_url: String,
+    pub publish_time: i64,
+    pub recv_time: i64,
+    pub source: String,
+    pub content_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SyncSummary {
+    pub run_id: i64,
+    pub scanned: usize,
+    pub matched: usize,
+    pub inserted: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub cursors_advanced: usize,
+}
+
 pub struct ArticleIndex {
     conn: Connection,
 }
 
 impl ArticleIndex {
     pub fn open_default() -> Result<Self> {
+        if let Some(path) = std::env::var_os(INDEX_PATH_ENV).filter(|value| !value.is_empty()) {
+            return Self::open(PathBuf::from(path));
+        }
         let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         Self::open(base.join(".wx-cli").join("index").join("articles.db"))
     }
@@ -306,6 +365,202 @@ impl ArticleIndex {
             params![Utc::now().timestamp(), id],
         )? > 0)
     }
+
+    pub fn incremental_since(&self) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.wechat_biz, COALESCE(c.last_recv_time, 0)
+             FROM subscriptions s
+             LEFT JOIN sync_cursors c
+               ON c.source = 'wechat_local' AND c.shard_key = s.wechat_biz
+             WHERE s.enabled = 1",
+        )?;
+        let cursors: Vec<i64> = stmt
+            .query_map([], |row| row.get(1))?
+            .collect::<std::result::Result<_, _>>()?;
+        if cursors.is_empty() || cursors.iter().any(|value| *value == 0) {
+            Ok(None)
+        } else {
+            Ok(cursors.into_iter().min())
+        }
+    }
+
+    pub fn ingest_local_articles(
+        &mut self,
+        scanned: usize,
+        items: &[LocalArticleInput],
+    ) -> Result<SyncSummary> {
+        let now = Utc::now().timestamp();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO sync_runs (source, started_at, status, scanned)
+             VALUES ('wechat_local', ?1, 'running', ?2)",
+            params![now, scanned as i64],
+        )?;
+        let run_id = tx.last_insert_rowid();
+
+        let enabled: HashSet<String> = {
+            let mut stmt = tx.prepare("SELECT wechat_biz FROM subscriptions WHERE enabled = 1")?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        let mut cursors: HashMap<String, i64> = HashMap::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT shard_key, last_recv_time FROM sync_cursors WHERE source = 'wechat_local'",
+            )?;
+            for row in stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))? {
+                let (biz, cursor) = row?;
+                cursors.insert(biz, cursor);
+            }
+        }
+
+        let mut inserted = 0usize;
+        let mut updated = 0usize;
+        let mut matched = 0usize;
+        let mut max_recv_by_biz: HashMap<String, i64> = HashMap::new();
+
+        for item in items {
+            if !enabled.contains(&item.wechat_biz) {
+                continue;
+            }
+            matched += 1;
+            max_recv_by_biz
+                .entry(item.wechat_biz.clone())
+                .and_modify(|value| *value = (*value).max(item.recv_time))
+                .or_insert(item.recv_time);
+            if item.recv_time < cursors.get(&item.wechat_biz).copied().unwrap_or(0) {
+                continue;
+            }
+
+            tx.execute(
+                "UPDATE accounts SET account_username = ?1, display_name = ?2, last_seen_at = ?3
+                 WHERE wechat_biz = ?4",
+                params![
+                    item.account_username,
+                    item.account_display,
+                    now,
+                    item.wechat_biz
+                ],
+            )?;
+            let account_id: i64 = tx.query_row(
+                "SELECT id FROM accounts WHERE wechat_biz = ?1",
+                params![item.wechat_biz],
+                |row| row.get(0),
+            )?;
+            if !item.account_display.is_empty() {
+                tx.execute(
+                    "INSERT INTO account_aliases (account_id, alias, first_seen_at, last_seen_at)
+                     VALUES (?1, ?2, ?3, ?3)
+                     ON CONFLICT(account_id, alias) DO UPDATE SET last_seen_at = excluded.last_seen_at",
+                    params![account_id, item.account_display, now],
+                )?;
+            }
+            tx.execute(
+                "UPDATE subscriptions SET status = 'active', updated_at = ?1 WHERE wechat_biz = ?2",
+                params![now, item.wechat_biz],
+            )?;
+
+            let existed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM articles WHERE wechat_biz = ?1 AND mid = ?2 AND idx = ?3)",
+                params![item.wechat_biz, item.mid, item.idx],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO articles
+                   (account_id, wechat_biz, mid, idx, sn, canonical_url, title, digest, cover_url,
+                    publish_time, recv_time, discovered_at, source, content_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'wechat_local', 'metadata_only')
+                 ON CONFLICT(wechat_biz, mid, idx) DO UPDATE SET
+                   account_id = excluded.account_id, sn = excluded.sn,
+                   canonical_url = excluded.canonical_url, title = excluded.title,
+                   digest = excluded.digest, cover_url = excluded.cover_url,
+                   publish_time = excluded.publish_time, recv_time = excluded.recv_time",
+                params![
+                    account_id, item.wechat_biz, item.mid, item.idx, item.sn,
+                    item.canonical_url, item.title, item.digest, item.cover_url,
+                    item.publish_time, item.recv_time, now
+                ],
+            )?;
+            if existed {
+                updated += 1;
+            } else {
+                inserted += 1;
+            }
+        }
+
+        for (biz, recv_time) in &max_recv_by_biz {
+            tx.execute(
+                "INSERT INTO sync_cursors (source, shard_key, last_recv_time, updated_at)
+                 VALUES ('wechat_local', ?1, ?2, ?3)
+                 ON CONFLICT(source, shard_key) DO UPDATE SET
+                   last_recv_time = MAX(last_recv_time, excluded.last_recv_time),
+                   updated_at = excluded.updated_at",
+                params![biz, recv_time, now],
+            )?;
+        }
+        let skipped = scanned.saturating_sub(matched);
+        tx.execute(
+            "UPDATE sync_runs SET finished_at = ?1, status = 'completed', inserted = ?2, updated = ?3
+             WHERE id = ?4",
+            params![now, inserted as i64, updated as i64, run_id],
+        )?;
+        tx.commit()?;
+        Ok(SyncSummary {
+            run_id,
+            scanned,
+            matched,
+            inserted,
+            updated,
+            skipped,
+            cursors_advanced: max_recv_by_biz.len(),
+        })
+    }
+
+    pub fn query_articles(
+        &self,
+        account: Option<&str>,
+        since: Option<i64>,
+        until: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<IndexedArticle>> {
+        let account_pattern = account.map(|value| format!("%{}%", value.to_lowercase()));
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id, a.account_id, COALESCE(ac.account_username, ''),
+                    COALESCE(ac.display_name, ''), a.wechat_biz, a.mid, a.idx, a.sn,
+                    a.canonical_url, a.title, a.digest, a.cover_url, a.publish_time, a.recv_time,
+                    a.source, a.content_status
+             FROM articles a JOIN accounts ac ON ac.id = a.account_id
+             WHERE (?1 IS NULL OR lower(COALESCE(ac.display_name, '')) LIKE ?1
+                              OR lower(COALESCE(ac.account_username, '')) LIKE ?1
+                              OR lower(a.wechat_biz) LIKE ?1)
+               AND (?2 IS NULL OR a.publish_time >= ?2)
+               AND (?3 IS NULL OR a.publish_time <= ?3)
+             ORDER BY a.publish_time DESC, a.id DESC LIMIT ?4",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(stmt
+            .query_map(params![account_pattern, since, until, limit], |row| {
+                Ok(IndexedArticle {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    account_username: row.get(2)?,
+                    account: row.get(3)?,
+                    wechat_biz: row.get(4)?,
+                    mid: row.get(5)?,
+                    idx: row.get(6)?,
+                    sn: row.get(7)?,
+                    canonical_url: row.get(8)?,
+                    title: row.get(9)?,
+                    digest: row.get(10)?,
+                    cover_url: row.get(11)?,
+                    publish_time: row.get(12)?,
+                    recv_time: row.get(13)?,
+                    source: row.get(14)?,
+                    content_status: row.get(15)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
 }
 
 fn query_subscription(conn: &Connection, biz: &str) -> rusqlite::Result<SubscriptionRecord> {
@@ -436,6 +691,98 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("微信公众号文章链接"));
         assert!(index.list_subscriptions().unwrap().is_empty());
+        drop(index);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn local_article(biz: &str, mid: &str, recv_time: i64, account: &str) -> LocalArticleInput {
+        LocalArticleInput {
+            account_username: format!("gh_{biz}"),
+            account_display: account.into(),
+            wechat_biz: biz.into(),
+            mid: mid.into(),
+            idx: "1".into(),
+            sn: Some("sn".into()),
+            canonical_url: format!("https://mp.weixin.qq.com/s?__biz={biz}&mid={mid}&idx=1&sn=sn"),
+            title: format!("article-{mid}"),
+            digest: "digest".into(),
+            cover_url: "https://example.com/cover.jpg".into(),
+            publish_time: recv_time - 10,
+            recv_time,
+        }
+    }
+
+    #[test]
+    fn sync_is_subscription_scoped_idempotent_and_cursor_based() {
+        let path = std::env::temp_dir().join(format!(
+            "wx-cli-article-sync-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let mut index = ArticleIndex::open(&path).unwrap();
+        index
+            .add_subscription_by_url("https://mp.weixin.qq.com/s?__biz=BizA&mid=1&idx=1")
+            .unwrap();
+        assert_eq!(index.incremental_since().unwrap(), None);
+
+        let first = vec![
+            local_article("BizA", "10", 100, "Alpha"),
+            local_article("BizB", "20", 110, "Other"),
+        ];
+        let summary = index.ingest_local_articles(first.len(), &first).unwrap();
+        assert_eq!(summary.inserted, 1);
+        assert_eq!(summary.matched, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(index.incremental_since().unwrap(), Some(100));
+
+        let second = vec![
+            local_article("BizA", "10", 100, "Alpha renamed"),
+            local_article("BizA", "11", 120, "Alpha renamed"),
+        ];
+        let summary = index.ingest_local_articles(second.len(), &second).unwrap();
+        assert_eq!(summary.inserted, 1);
+        assert_eq!(summary.updated, 1);
+        assert_eq!(index.incremental_since().unwrap(), Some(120));
+        let rows = index
+            .query_articles(Some("renamed"), None, None, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].mid, "11");
+        assert_eq!(rows[0].source, LOCAL_SOURCE);
+
+        let alias_count: i64 = index
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_aliases WHERE alias IN ('Alpha', 'Alpha renamed')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alias_count, 2);
+        drop(index);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn adding_new_subscription_forces_one_full_backfill() {
+        let path = std::env::temp_dir().join(format!(
+            "wx-cli-article-new-sub-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let mut index = ArticleIndex::open(&path).unwrap();
+        index
+            .add_subscription_by_url("https://mp.weixin.qq.com/s?__biz=BizA&mid=1&idx=1")
+            .unwrap();
+        index
+            .ingest_local_articles(1, &[local_article("BizA", "10", 100, "Alpha")])
+            .unwrap();
+        assert_eq!(index.incremental_since().unwrap(), Some(100));
+
+        index
+            .add_subscription_by_url("https://mp.weixin.qq.com/s?__biz=BizB&mid=2&idx=1")
+            .unwrap();
+        assert_eq!(index.incremental_since().unwrap(), None);
         drop(index);
         let _ = std::fs::remove_file(path);
     }

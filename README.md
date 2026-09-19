@@ -282,6 +282,19 @@ wx biz-articles --unread                          # 仅有未读的公众号，�
 wx biz-articles --json | jq '.[].url'             # 下游消费 URL
 ```
 
+可以用任意一篇公众号文章链接建立本地订阅，再把微信已缓存的该公众号文章增量写入独立索引：
+
+```bash
+wx subscribe add --url "https://mp.weixin.qq.com/s?__biz=...&mid=...&idx=1"
+wx subscribe sync                                  # 首次回补本地保留历史，之后按账号游标增量
+wx subscribe articles -n 50                       # 只查索引，不再扫描微信数据库
+wx subscribe articles --account "返朴" --since 2026-01-01 --json
+```
+
+索引默认位于 `~/.wx-cli/index/articles.db`。测试或临时运行可通过
+`WX_ARTICLE_INDEX_PATH` 指向隔离数据库。采集来源固定为 `wechat_local`；它覆盖的是本机微信仍保留的数据，
+不承诺补齐公众号服务端全部历史文章。
+
 每条返回：`account` / `account_username` / `title` / `url` / `digest` / `cover_url` / `time` / `timestamp` / `recv_time_str`。多图文推送会展开成多行。
 
 ### 附件提取（图片）
