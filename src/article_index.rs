@@ -1,3 +1,10 @@
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
+use rusqlite::{params, Connection};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArticleUrlIdentity {
     Wechat {
@@ -148,6 +155,181 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SubscriptionRecord {
+    pub id: i64,
+    pub account_id: i64,
+    pub wechat_biz: String,
+    pub seed_url: String,
+    pub status: String,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub struct ArticleIndex {
+    conn: Connection,
+}
+
+impl ArticleIndex {
+    pub fn open_default() -> Result<Self> {
+        let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        Self::open(base.join(".wx-cli").join("index").join("articles.db"))
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建文章索引目录失败: {}", parent.display()))?;
+        }
+        let conn = Connection::open(path)
+            .with_context(|| format!("打开文章索引失败: {}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS accounts (
+                 id INTEGER PRIMARY KEY,
+                 account_username TEXT UNIQUE,
+                 wechat_biz TEXT NOT NULL UNIQUE,
+                 display_name TEXT,
+                 source TEXT NOT NULL CHECK(source = 'wechat_local'),
+                 first_seen_at INTEGER NOT NULL,
+                 last_seen_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS account_aliases (
+                 account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 alias TEXT NOT NULL,
+                 first_seen_at INTEGER NOT NULL,
+                 last_seen_at INTEGER NOT NULL,
+                 UNIQUE(account_id, alias)
+             );
+             CREATE TABLE IF NOT EXISTS subscriptions (
+                 id INTEGER PRIMARY KEY,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 wechat_biz TEXT NOT NULL UNIQUE,
+                 seed_url TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK(status IN ('pending_local_discovery', 'active')),
+                 enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS articles (
+                 id INTEGER PRIMARY KEY,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 wechat_biz TEXT NOT NULL,
+                 mid TEXT,
+                 idx TEXT,
+                 sn TEXT,
+                 canonical_url TEXT NOT NULL,
+                 normalized_url_hash TEXT,
+                 title TEXT NOT NULL,
+                 digest TEXT NOT NULL DEFAULT '',
+                 cover_url TEXT NOT NULL DEFAULT '',
+                 publish_time INTEGER NOT NULL,
+                 recv_time INTEGER NOT NULL,
+                 discovered_at INTEGER NOT NULL,
+                 source TEXT NOT NULL CHECK(source = 'wechat_local'),
+                 content_status TEXT NOT NULL DEFAULT 'metadata_only',
+                 UNIQUE(wechat_biz, mid, idx),
+                 UNIQUE(normalized_url_hash)
+             );
+             CREATE TABLE IF NOT EXISTS sync_cursors (
+                 source TEXT NOT NULL CHECK(source = 'wechat_local'),
+                 shard_key TEXT NOT NULL,
+                 last_recv_time INTEGER NOT NULL DEFAULT 0,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY(source, shard_key)
+             );
+             CREATE TABLE IF NOT EXISTS sync_runs (
+                 id INTEGER PRIMARY KEY,
+                 source TEXT NOT NULL CHECK(source = 'wechat_local'),
+                 started_at INTEGER NOT NULL,
+                 finished_at INTEGER,
+                 status TEXT NOT NULL,
+                 scanned INTEGER NOT NULL DEFAULT 0,
+                 inserted INTEGER NOT NULL DEFAULT 0,
+                 updated INTEGER NOT NULL DEFAULT 0,
+                 error TEXT
+             );",
+        )?;
+        Ok(Self { conn })
+    }
+
+    pub fn add_subscription_by_url(&mut self, raw_url: &str) -> Result<SubscriptionRecord> {
+        let ArticleUrlIdentity::Wechat {
+            biz, canonical_url, ..
+        } = parse_article_url(raw_url)
+        else {
+            bail!("订阅链接必须是包含 __biz、mid、idx 的微信公众号文章链接");
+        };
+
+        let now = Utc::now().timestamp();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO accounts (wechat_biz, source, first_seen_at, last_seen_at)
+             VALUES (?1, 'wechat_local', ?2, ?2)
+             ON CONFLICT(wechat_biz) DO UPDATE SET last_seen_at = excluded.last_seen_at",
+            params![biz, now],
+        )?;
+        let account_id: i64 = tx.query_row(
+            "SELECT id FROM accounts WHERE wechat_biz = ?1",
+            params![biz],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO subscriptions
+                 (account_id, wechat_biz, seed_url, status, enabled, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'pending_local_discovery', 1, ?4, ?4)
+             ON CONFLICT(wechat_biz) DO UPDATE SET
+                 seed_url = excluded.seed_url, enabled = 1, updated_at = excluded.updated_at",
+            params![account_id, biz, canonical_url, now],
+        )?;
+        let record = query_subscription(&tx, &biz)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn list_subscriptions(&self) -> Result<Vec<SubscriptionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, account_id, wechat_biz, seed_url, status, enabled, created_at, updated_at
+             FROM subscriptions ORDER BY created_at, id",
+        )?;
+        Ok(stmt
+            .query_map([], subscription_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn remove_subscription(&self, id: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE subscriptions SET enabled = 0, updated_at = ?1 WHERE id = ?2 AND enabled = 1",
+            params![Utc::now().timestamp(), id],
+        )? > 0)
+    }
+}
+
+fn query_subscription(conn: &Connection, biz: &str) -> rusqlite::Result<SubscriptionRecord> {
+    conn.query_row(
+        "SELECT id, account_id, wechat_biz, seed_url, status, enabled, created_at, updated_at
+         FROM subscriptions WHERE wechat_biz = ?1",
+        params![biz],
+        subscription_from_row,
+    )
+}
+
+fn subscription_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubscriptionRecord> {
+    Ok(SubscriptionRecord {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        wechat_biz: row.get(2)?,
+        seed_url: row.get(3)?,
+        status: row.get(4)?,
+        enabled: row.get::<_, i64>(5)? != 0,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +397,46 @@ mod tests {
         );
         assert_eq!(parse_article_url("not a url"), ArticleUrlIdentity::Invalid);
     }
+
+    #[test]
+    fn url_subscription_is_idempotent_and_can_be_disabled() {
+        let path = std::env::temp_dir().join(format!(
+            "wx-cli-article-index-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let mut index = ArticleIndex::open(&path).expect("open test index");
+        let first = index
+            .add_subscription_by_url("https://mp.weixin.qq.com/s?__biz=MzA%3D&mid=42&idx=1&sn=old")
+            .expect("add first subscription");
+        let second = index
+            .add_subscription_by_url("https://mp.weixin.qq.com/s?idx=1&mid=42&__biz=MzA%3D&sn=new")
+            .expect("add same account again");
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(index.list_subscriptions().unwrap().len(), 1);
+        assert_eq!(second.status, "pending_local_discovery");
+        assert!(index.remove_subscription(second.id).unwrap());
+        assert!(!index.list_subscriptions().unwrap()[0].enabled);
+
+        drop(index);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn subscription_rejects_external_url_before_database_write() {
+        let path = std::env::temp_dir().join(format!(
+            "wx-cli-article-index-external-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let mut index = ArticleIndex::open(&path).unwrap();
+        let error = index
+            .add_subscription_by_url("https://example.com/article")
+            .unwrap_err();
+        assert!(error.to_string().contains("微信公众号文章链接"));
+        assert!(index.list_subscriptions().unwrap().is_empty());
+        drop(index);
+        let _ = std::fs::remove_file(path);
+    }
 }
-use sha2::{Digest, Sha256};

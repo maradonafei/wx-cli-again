@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
+use crate::article_index::{parse_article_url, ArticleUrlIdentity};
 use super::cache::{CacheMode, DbCache};
 use super::meta::{derive_status, discover_unknown_shards, Meta};
 
@@ -5002,7 +5003,8 @@ pub async fn q_biz_articles(
         .into_iter()
         .map(|a| {
             let account_display = names.display(&a.account_username);
-            json!({
+            let identity = parse_article_url(&a.url);
+            let mut row = json!({
                 "time": fmt_time(a.pub_time, "%Y-%m-%d %H:%M"),
                 "timestamp": a.pub_time,
                 "recv_time": a.recv_time,
@@ -5013,7 +5015,29 @@ pub async fn q_biz_articles(
                 "url": a.url,
                 "digest": a.digest,
                 "cover_url": a.cover,
-            })
+                "source": "wechat_local",
+                "content_status": "metadata_only",
+            });
+            match identity {
+                ArticleUrlIdentity::Wechat { biz, mid, idx, sn, identity_key, canonical_url } => {
+                    row["url_status"] = json!("wechat_article");
+                    row["wechat_biz"] = json!(biz);
+                    row["mid"] = json!(mid);
+                    row["idx"] = json!(idx);
+                    row["sn"] = json!(sn);
+                    row["identity_key"] = json!(identity_key);
+                    row["canonical_url"] = json!(canonical_url);
+                }
+                ArticleUrlIdentity::External { normalized_url, normalized_url_hash } => {
+                    row["url_status"] = json!("external");
+                    row["normalized_url"] = json!(normalized_url);
+                    row["normalized_url_hash"] = json!(normalized_url_hash);
+                }
+                ArticleUrlIdentity::Invalid => {
+                    row["url_status"] = json!("invalid_url");
+                }
+            }
+            row
         })
         .collect();
 

@@ -19,6 +19,7 @@ pub mod sns_feed;
 pub mod sns_notifications;
 pub mod sns_search;
 pub mod stats;
+pub mod subscribe;
 pub mod timeline;
 pub mod transport;
 pub mod unread;
@@ -272,6 +273,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// 管理微信公众号文章订阅与本地文章索引
+    Subscribe {
+        #[command(subcommand)]
+        action: SubscribeAction,
+    },
     /// 朋友圈全文搜索：匹配正文关键词
     SnsSearch {
         /// 关键词
@@ -406,6 +412,32 @@ enum KeyAction {
         db: String,
         /// 64 位 hex
         enc_key: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SubscribeAction {
+    /// 使用任意一篇公众号文章链接订阅该公众号
+    Add {
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出公众号订阅
+    List {
+        /// 同时显示已停用订阅
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 按订阅 ID 停用订阅
+    Remove {
+        #[arg(long)]
+        account_id: i64,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -608,6 +640,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             unread,
             json,
         } => biz_articles::cmd_biz_articles(limit, account, since, until, unread, json),
+        Commands::Subscribe { action } => match action {
+            SubscribeAction::Add { url, json } => subscribe::cmd_add(url, json),
+            SubscribeAction::List { all, json } => subscribe::cmd_list(all, json),
+            SubscribeAction::Remove { account_id, json } => subscribe::cmd_remove(account_id, json),
+        },
         Commands::Attachments {
             chat,
             kinds,
@@ -717,7 +754,8 @@ mod clap_msg_type_wiring_tests {
             }
             _ => panic!("expected Search"),
         }
-        let t = Cli::try_parse_from(["wx", "timeline", "--type", "57"]).expect("timeline --type 57");
+        let t =
+            Cli::try_parse_from(["wx", "timeline", "--type", "57"]).expect("timeline --type 57");
         match t.command {
             super::Commands::Timeline { msg_type, .. } => {
                 assert_eq!(msg_type.as_deref(), Some("57"));
@@ -737,5 +775,33 @@ mod clap_msg_type_wiring_tests {
             msg.contains("未知消息类型") || msg.contains("nope"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn subscribe_add_accepts_article_url() {
+        let cli = Cli::try_parse_from([
+            "wx",
+            "subscribe",
+            "add",
+            "--url",
+            "https://mp.weixin.qq.com/s?__biz=MzA%3D&mid=42&idx=1",
+            "--json",
+        ])
+        .expect("subscribe add should parse");
+        match cli.command {
+            super::Commands::Subscribe {
+                action: super::SubscribeAction::Add { url, json },
+            } => {
+                assert!(url.contains("mp.weixin.qq.com"));
+                assert!(json);
+            }
+            _ => panic!("expected subscribe add"),
+        }
+    }
+
+    #[test]
+    fn subscribe_remove_requires_numeric_id() {
+        assert!(Cli::try_parse_from(["wx", "subscribe", "remove", "--account-id", "12"]).is_ok());
+        assert!(Cli::try_parse_from(["wx", "subscribe", "remove", "--account-id", "abc"]).is_err());
     }
 }
