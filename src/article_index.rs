@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const LOCAL_SOURCE: &str = "wechat_local";
 const INDEX_PATH_ENV: &str = "WX_ARTICLE_INDEX_PATH";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,9 +353,10 @@ impl ArticleIndex {
             "SELECT id, account_id, wechat_biz, seed_url, status, enabled, created_at, updated_at
              FROM subscriptions ORDER BY created_at, id",
         )?;
-        Ok(stmt
+        let records = stmt
             .query_map([], subscription_from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(records)
     }
 
     pub fn remove_subscription(&self, id: i64) -> Result<bool> {
@@ -400,8 +400,10 @@ impl ArticleIndex {
 
         let enabled: HashSet<String> = {
             let mut stmt = tx.prepare("SELECT wechat_biz FROM subscriptions WHERE enabled = 1")?;
-            stmt.query_map([], |row| row.get(0))?
-                .collect::<std::result::Result<_, _>>()?
+            let values = stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            values
         };
         let mut cursors: HashMap<String, i64> = HashMap::new();
         {
@@ -538,7 +540,7 @@ impl ArticleIndex {
              ORDER BY a.publish_time DESC, a.id DESC LIMIT ?4",
         )?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        Ok(stmt
+        let articles = stmt
             .query_map(params![account_pattern, since, until, limit], |row| {
                 Ok(IndexedArticle {
                     id: row.get(0)?,
@@ -559,7 +561,8 @@ impl ArticleIndex {
                     content_status: row.get(15)?,
                 })
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(articles)
     }
 }
 
@@ -748,7 +751,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].mid, "11");
-        assert_eq!(rows[0].source, LOCAL_SOURCE);
+        assert_eq!(rows[0].source, "wechat_local");
 
         let alias_count: i64 = index
             .conn
