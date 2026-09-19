@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "codex/**"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-test:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+          - name: Windows x86_64 MSVC
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check
+        run: cargo check --locked
+      - name: Test
+        run: cargo test --locked
+
+  windows-artifact:
+    name: Windows release artifact
+    needs: check-test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      ASSET_NAME: wx-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build locked release binary
+        run: cargo build --release --locked
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifact -Force | Out-Null
+          Copy-Item "target\release\wx.exe" "artifact\$env:ASSET_NAME"
+          & "artifact\$env:ASSET_NAME" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wx-windows-x86_64-${{ github.sha }}
+          path: artifact/wx-windows-x86_64.exe
+          if-no-files-found: error
+          retention-days: 7
